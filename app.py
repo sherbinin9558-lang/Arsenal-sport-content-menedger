@@ -9,9 +9,12 @@ from crm_core import create_lead, crm_metrics, load_leads, update_lead, add_lead
 from free_automation import load_orders, create_order, update_order, order_metrics, low_stock, customer_history, content_bundle, seven_day_plan, conversion_metrics
 from automation_suite import low_stock_products, stock_info, content_for_product, make_30_day_plan, bulk_update, analytics as automation_analytics, save_uploaded_photo, product_key
 from content_manager import WORKFLOW_STATUSES, ensure_workflow, change_status, adapt_content, workflow_metrics, recommendations, report_lines
-from growth_engine import ai_summary, attribution_performance
-from saas_core import require_saas_access, render_account_bar, data_load, data_save, tenant_plan, feature_allowed, activate_paid_subscription, can, platform_admin_enabled, platform_admin_snapshot, platform_admin_set_tenant, platform_admin_set_subscription
+from growth_engine import ai_summary, attribution_performance, recommendations as growth_recommendations
+from saas_core import require_saas_access, render_account_bar, data_load, data_save, data_load_page, data_update_record, data_delete_record, DataConflictError, saas_enabled, tenant_plan, feature_allowed, activate_paid_subscription, can, platform_admin_enabled, platform_admin_snapshot, platform_admin_set_tenant, platform_admin_set_subscription
 from webmcp_tools import mount_webmcp_tools
+from ui.catalog import render_catalog
+from ui.dashboard import render_dashboard
+from ui.settings import render_settings
 
 # ==================== КОНФИГУРАЦИЯ ====================
 PRODUCTS_FILE = Path("products.json")
@@ -57,8 +60,15 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-def load_products(): return data_load("products", [])
-def save_products(p): data_save("products", p)
+def load_products():
+    key = "_app_products_cache"
+    if key not in st.session_state:
+        st.session_state[key] = data_load("products", [])
+    return st.session_state[key]
+
+def save_products(p):
+    data_save("products", p)
+    st.session_state["_app_products_cache"] = p
 def add_product(prod):
     p = load_products()
     if not feature_allowed("products", len(p)):
@@ -75,30 +85,48 @@ def _find_record_index(rows, record_id):
             return idx
     return None
 
-def update_product(record_id, prod):
+def update_product(record_id, prod, existing=None):
+    if existing is not None and existing.get("_saas_record_id") and existing.get("_saas_updated_at") and saas_enabled():
+        merged = dict(existing)
+        merged.update(dict(prod or {}))
+        merged.pop("_saas_updated_at", None)
+        data_update_record("products", existing["_saas_record_id"], merged, existing["_saas_updated_at"])
+        st.session_state.pop("_app_products_cache", None)
+        return
     p = load_products()
     idx = _find_record_index(p, record_id)
     if idx is not None:
-        existing = dict(p[idx] or {})
+        current = dict(p[idx] or {})
         updated = dict(prod or {})
-        stable_id = existing.get("_saas_record_id")
-        existing.update(updated)
+        stable_id = current.get("_saas_record_id")
+        current.update(updated)
         if stable_id:
-            existing["_saas_record_id"] = stable_id
+            current["_saas_record_id"] = stable_id
         else:
-            existing.pop("_saas_record_id", None)
-        p[idx] = existing
+            current.pop("_saas_record_id", None)
+        p[idx] = current
         save_products(p)
 
-def delete_product(record_id):
+def delete_product(record_id, existing=None):
+    if existing is not None and existing.get("_saas_record_id") and existing.get("_saas_updated_at") and saas_enabled():
+        data_delete_record("products", existing["_saas_record_id"], existing["_saas_updated_at"])
+        st.session_state.pop("_app_products_cache", None)
+        return
     p = load_products()
     idx = _find_record_index(p, record_id)
     if idx is not None:
         p.pop(idx)
         save_products(p)
 
-def load_plan(): return data_load("content_plan", [])
-def save_plan(pl): data_save("content_plan", pl)
+def load_plan():
+    key = "_app_plan_cache"
+    if key not in st.session_state:
+        st.session_state[key] = data_load("content_plan", [])
+    return st.session_state[key]
+
+def save_plan(pl):
+    data_save("content_plan", pl)
+    st.session_state["_app_plan_cache"] = pl
 
 ATTRIBUTION_FILE = Path("content_attribution.json")
 def load_attribution(): return data_load("content_attribution", [])
@@ -541,6 +569,19 @@ def render_platform_admin():
             st.error(f"Не удалось сохранить: {e}")
 
     st.markdown("---")
+    st.markdown("### Настройки администратора")
+    st.caption("Системные настройки платформы. Чувствительные параметры не хранятся и не редактируются через клиентский интерфейс.")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Доступ", "Разрешён")
+    s2.metric("Режим", "Platform Owner")
+    s3.metric("Управление", "Системное")
+    st.write("**Администратор платформы:** определяется серверной конфигурацией.")
+    st.write("**Безопасность:** секретные ключи и доступ к сервисной роли остаются вне интерфейса.")
+    st.caption("Изменение системных секретов выполняется только в настройках окружения. Это предотвращает сохранение чувствительных данных в базе и в клиентском коде.")
+    if st.button("↻ Обновить данные админ-панели", key="platform_admin_refresh", use_container_width=True):
+        st.rerun()
+
+    st.markdown("---")
     st.markdown("### Аккаунты")
     account_rows = []
     for u in users:
@@ -722,8 +763,7 @@ button[key="sidebar_max"]{background:linear-gradient(135deg,#b8ff00,#7cff00)!imp
 /* MAX dialog. */
 div[data-testid="stDialog"]{display:flex!important;visibility:visible!important;opacity:1!important;position:fixed!important;inset:0!important;z-index:2147483647!important;pointer-events:auto!important;}
 div[data-testid="stDialog"]>div,div[data-testid="stDialog"] [role="dialog"],div[role="dialog"]{visibility:visible!important;opacity:1!important;pointer-events:auto!important;}
-div[data-testid="stDialog"] [role="dialog"]{display:block!important;position:relative!important;z-index:2147483647!important;background:linear-gradient(180deg,#ffffff 0%,#f8f9fc 100%)!important;color:#17151c!important;border:1px solid #d9ddea!important;border-radius:22px!important;box-shadow:0 28px 90px rgba(12,16,28,.34),0 0 0 1px rgba(91,92,226,.06)!important;max-height:90vh!important;overflow:auto!important;} div[data-testid="stDialog"] [role="dialog"]>button:first-of-type{width:38px!important;height:38px!important;border-radius:12px!important;border:1px solid #d7ff72!important;background:#b8ff00!important;color:#101500!important;box-shadow:0 0 16px rgba(184,255,0,.38)!important;right:14px!important;top:14px!important;} div[data-testid="stDialog"] [role="dialog"]>button:first-of-type:hover{background:#7cff00!important;transform:translateY(-1px)!important;}
-div[data-testid="stDialog"] [role="dialog"] *{visibility:visible!important;}
+div[data-testid="stDialog"] [role="dialog"]{display:block!important;position:relative!important;z-index:2147483647!important;background:linear-gradient(180deg,#ffffff 0%,#f8f9fc 100%)!important;color:#17151c!important;border:1px solid #d9ddea!important;border-radius:22px!important;box-shadow:0 28px 90px rgba(12,16,28,.34),0 0 0 1px rgba(91,92,226,.06)!important;max-height:90vh!important;overflow:auto!important;} div[data-testid="stDialog"] [role="dialog"] *{visibility:visible!important;}
 [data-testid="stDialog"] [data-testid="stExpander"] button,div[role="dialog"] [data-testid="stExpander"] button{color:#b8ff00!important;opacity:1!important;}
 [data-testid="stDialog"] [data-testid="stExpander"] button svg,[data-testid="stDialog"] [data-testid="stExpander"] button svg *,div[role="dialog"] [data-testid="stExpander"] button svg,div[role="dialog"] [data-testid="stExpander"] button svg *{color:#b8ff00!important;stroke:#b8ff00!important;fill:none!important;opacity:1!important;stroke-width:3px!important;filter:drop-shadow(0 0 6px rgba(184,255,0,.9))!important;}
 .max-header{display:block!important;width:100%!important;padding:6px 52px 14px 0!important;border-bottom:1px solid #e8ebf1!important;margin-bottom:8px!important;}.max-header-title{font-size:clamp(1.25rem,2vw,1.55rem)!important;line-height:1.2!important;font-weight:950!important;letter-spacing:-.02em!important;color:#21164d!important;}.max-header-title span{color:#7cff00!important;text-shadow:0 0 8px rgba(184,255,0,.55)!important;}.max-header-subtitle{margin-top:4px!important;font-size:.82rem!important;color:#687182!important;}
@@ -767,180 +807,20 @@ if tab_admin is not None:
         render_platform_admin()
 
 with tab_dashboard:
-    # Reuse one dashboard snapshot so opening MAX does not trigger another
-    # round of Supabase reads.
-    if "max_data_snapshot" not in st.session_state:
-        st.session_state["max_data_snapshot"] = {
-            "products": load_products(),
-            "plan": load_plan(),
-            "leads": load_leads(),
-            "orders": load_orders(),
-        }
-    snap = st.session_state["max_data_snapshot"]
-    products = snap["products"]
-    plan = snap["plan"]
-    leads = snap["leads"]
-    orders = snap["orders"]
-    crm = crm_metrics(leads)
-    om = order_metrics(orders, {"Новая", "Связались", "Ожидает оплаты", "Оплачен", "Собирается", "Отправлен"})
-    cm = conversion_metrics(leads, orders)
-    wm = workflow_metrics(plan)
-    low = low_stock_products(products)
-    due, overdue = [], []
-    today = datetime.date.today()
-    for item in plan:
-        try:
-            item_date = datetime.date.fromisoformat(str(item.get("date", "")))
-            if item.get("status") != "Опубликовано":
-                (overdue if item_date < today else due if item_date == today else []).append(item)
-        except Exception:
-            pass
-
-    store_name = st.session_state.get("saas_tenant_name", "Ваш магазин")
-    first_run = len(products) == 0 and len(leads) == 0 and len(orders) == 0
-    try:
-        ai_next = recommendations(products, leads, orders, plan)
-    except Exception:
-        ai_next = []
-
-    st.markdown(
-        f'<div class="dashboard-hero">'
-        f'<div class="dashboard-hero-kicker">AI BUSINESS COMMAND CENTER</div>'
-        f'<div class="dashboard-hero-title">Добро пожаловать в {store_name}</div>'
-        f'<div class="dashboard-hero-text">MAX смотрит на каталог, контент и продажи и помогает решить следующую задачу — без лишней рутины.</div>'
-        f'</div>',
-        unsafe_allow_html=True,
+    render_dashboard(
+        load_products=load_products, load_plan=load_plan, load_leads=load_leads, load_orders=load_orders,
+        crm_metrics=crm_metrics, order_metrics=order_metrics, conversion_metrics=conversion_metrics,
+        workflow_metrics=workflow_metrics, low_stock_products=low_stock_products,
+        growth_recommendations=growth_recommendations, max_product_title=max_product_title,
+        attribution_loader=load_attribution, attribution_metrics=attribution_metrics,
+        add_product=add_product, categories=CATEGORIES, can_write=can("write_data"),
     )
-
-    if first_run:
-        st.markdown(
-            '<div class="first-run-card"><div class="first-run-kicker">ПЕРВЫЙ ЗАПУСК</div>'
-            '<div class="first-run-title">Запустим магазин за несколько шагов</div>'
-            '<div class="first-run-text">Добавьте первый товар — затем MAX поможет создать контент и подготовить следующий шаг.</div></div>',
-            unsafe_allow_html=True,
-        )
-        fr1, fr2, fr3 = st.columns(3)
-        fr1.metric("Шаг 1", "Магазин ✓")
-        fr2.metric("Шаг 2", "Первый товар", "сейчас")
-        fr3.metric("Шаг 3", "Первый контент", "после товара")
-        with st.expander("Добавить первый товар прямо сейчас", expanded=st.session_state.get("first_run_quick_add", True)):
-            with st.form("first_run_product_form", clear_on_submit=True):
-                q1, q2 = st.columns(2)
-                with q1:
-                    fr_name = st.text_input("Название товара", placeholder="Футбольная форма")
-                    fr_brand = st.text_input("Бренд", placeholder="Nike")
-                    fr_article = st.text_input("Артикул", placeholder="ART-001")
-                with q2:
-                    fr_category = st.selectbox("Категория", CATEGORIES)
-                    fr_price = st.text_input("Цена, ₽", placeholder="4990")
-                    fr_stock = st.number_input("Остаток", min_value=0, value=1, step=1)
-                fr_submit = st.form_submit_button("Создать товар и передать его MAX", type="primary", use_container_width=True)
-            if fr_submit:
-                if not fr_name.strip():
-                    st.error("Укажите название товара.")
-                else:
-                    try:
-                        add_product({
-                            "name": fr_name.strip(), "brand": fr_brand.strip(), "article": fr_article.strip(),
-                            "category": fr_category, "price": fr_price.strip(), "stock": int(fr_stock),
-                            "sizes": "", "color": "", "description": "", "specs": "",
-                            "card_image": "", "date_added": str(datetime.date.today())
-                        })
-                        st.success("Товар создан. MAX уже может использовать его для контента и рекомендаций.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Не удалось создать товар: {e}")
-    else:
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Продажи", f'{om["amount"]:,.0f} ₽'.replace(",", " "))
-        d2.metric("Заявки", crm.get("total", 0))
-        d3.metric("Заказы", om.get("total", 0))
-        d4.metric("Конверсия", f'{cm["conversion"]:.1f}%')
-        d5.metric("Товаров", len(products))
-
-        q1, q2, q3 = st.columns(3)
-        with q1:
-            st.markdown("### Следующий шаг")
-            if ai_next:
-                st.write(ai_next[0])
-            else:
-                st.write("MAX пока собирает данные.")
-        with q2:
-            st.markdown("### Сегодня")
-            st.write(f"Контент: **{len(due)}** · Просрочено: **{len(overdue)}**")
-            st.write(f"Активные заказы: **{om['active']}**")
-        with q3:
-            st.markdown("### Состояние")
-            st.write(f"Каталог: **{len(products)}** товаров")
-            st.write(f"Заявки: **{crm.get('total',0)}** · Заказы: **{om.get('total',0)}**")
-
-    st.markdown("---")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("### Контент и задачи")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("В плане", wm.get("total", 0))
-        c2.metric("На проверке", wm.get("counts", {}).get("На проверке", 0))
-        c3.metric("Просрочено", wm.get("overdue", 0))
-        if overdue:
-            st.warning(f"Просроченных публикаций: {len(overdue)}")
-        if due:
-            st.info(f"На сегодня запланировано: {len(due)}")
-        if not overdue and not due:
-            st.success("Срочных контент-задач нет.")
-
-    with right:
-        st.markdown("### Склад")
-        s1, s2 = st.columns(2)
-        s1.metric("Позиций в каталоге", len(products))
-        s2.metric("Низкий остаток", len(low))
-        if low:
-            for product, qty in low[:8]:
-                st.write(f'• {max_product_title(product)} — {qty} шт.')
-        else:
-            st.success("Дефицитных позиций нет.")
-
-    st.markdown("---")
-    a, b = st.columns(2)
-    with a:
-        st.markdown("### Продажи")
-        st.write(f'Активных заказов: **{om["active"]}**')
-        st.write(f'Завершённых заказов: **{om["completed"]}**')
-        st.write(f'Отменённых заказов: **{om["cancelled"]}**')
-        st.write(f'Сумма неотменённых заказов: **{om["amount"]:,.0f} ₽**'.replace(",", " "))
-    with st.expander("🔗 Контент → продажи", expanded=True):
-        attribution = load_attribution()
-        st.caption("Новый слой атрибуции не меняет существующие заказы и CRM. Он готовит связь публикация → товар → лид → заказ.")
-        if not attribution:
-            st.info("Пока нет событий атрибуции. Существующий контент и продажи продолжают работать без изменений.")
-        else:
-            stats = attribution_metrics(attribution, leads, orders)
-            if stats:
-                for product_key, row in list(stats.items())[:8]:
-                    st.write(f"• {product_key}: контента {row['content']}, заявок {row['leads']}, заказов {row['orders']}")
-
-    with b:
-        st.markdown("### Быстрые действия")
-        if st.button("➕ Добавить товар", key="dash_add_product", use_container_width=True):
-            st.info("Откройте раздел «Создать» — там можно сразу загрузить фото и создать карточку.")
-        if st.button("📅 Открыть контент-план", key="dash_open_plan", use_container_width=True):
-            st.info("Откройте раздел «План» для управления публикациями и workflow.")
-
-    st.markdown("---")
-    st.markdown("### Состояние системы")
-    checks = [
-        ("Каталог", bool(products), f'{len(products)} товаров'),
-        ("CRM", True, f'{len(leads)} заявок'),
-        ("Заказы", True, f'{len(orders)} заказов'),
-        ("Контент workflow", True, f'{len(plan)} материалов'),
-        ("Склад", True, f'{len(low)} позиций с низким остатком'),
-    ]
-    for name, ok, detail in checks:
-        st.write(("🟢" if ok else "🟡") + f" **{name}** — {detail}")
 
 # ========== 1: СОЗДАТЬ КАРТОЧКУ ==========
 with tab1:
     st.markdown('<div class="section-kicker">CONTENT STUDIO</div><div class="section-title">Создать товар</div><div class="section-subtitle">Загрузите фото, заполните данные и сразу получите готовую карточку.</div>', unsafe_allow_html=True)
+    if not can("write_data"):
+        st.info("Ваша роль доступна только для просмотра. Создание товаров доступно пользователям с правом записи.")
     up = st.file_uploader("📷 Фото товара", type=["jpg","jpeg","png","webp"])
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -956,7 +836,7 @@ with tab1:
         template = st.selectbox("🎨 Шаблон", list(TEMPLATES.keys()))
     specs = st.text_input("Характеристики через запятую")
 
-    if st.button("🎨 Создать карточку", type="primary"):
+    if can("write_data") and st.button("🎨 Создать карточку", type="primary"):
         if not name or not brand:
             st.error("Заполните: Название и Бренд")
         else:
@@ -1098,133 +978,16 @@ def bulk_import_products(uploaded_file, update_existing=False):
 
 # ========== 2: КАТАЛОГ ==========
 with tab2:
-    st.markdown('<div class="section-kicker">PRODUCT LIBRARY</div><div class="section-title">Каталог</div><div class="section-subtitle">Все товары и готовые материалы — в одном рабочем пространстве.</div>', unsafe_allow_html=True)
-    st.info("➕ Для нового товара откройте вкладку «📸 Создать».")
-
-    st.markdown("### 📥 Массовая загрузка товаров")
-    st.caption("Загрузите CSV или XLSX — товары добавятся в каталог без удаления существующих.")
-    template_csv = io.StringIO()
-    writer = csv.writer(template_csv, delimiter=";")
-    writer.writerow(["Название", "Бренд", "Артикул", "Размеры", "Цвет", "Категория", "Описание", "Характеристики"])
-    writer.writerow(["Футбольная форма", "Пример", "ART-001", "S,M,L,XL", "Чёрный", "Другое", "Описание товара", "Материал, особенности"])
-    st.download_button(
-        "⬇️ Скачать шаблон CSV",
-        template_csv.getvalue().encode("utf-8-sig"),
-        file_name="ai_agent_content_manager_products_template.csv",
-        mime="text/csv",
-        key="bulk_template_csv",
+    render_catalog(
+        categories=CATEGORIES,
+        category_emoji=CATEGORY_EMOJI,
+        data_load_page=data_load_page,
+        update_product=update_product,
+        delete_product=delete_product,
+        bulk_import_products=bulk_import_products,
+        data_conflict_error=DataConflictError,
+        can_write=can("write_data"),
     )
-    bulk_file = st.file_uploader(
-        "Файл с товарами",
-        type=["csv", "xlsx"],
-        key="bulk_products_file",
-        help="В CSV используйте первую строку как названия колонок. Для XLSX — первая строка должна содержать заголовки.",
-    )
-    bulk_update = st.checkbox("Обновлять существующие товары по артикулу", value=False, key="bulk_update_existing")
-    if bulk_file and st.button("📦 Импортировать товары", type="primary", key="bulk_import_btn"):
-        try:
-            added, updated, skipped, errors = bulk_import_products(bulk_file, bulk_update)
-            st.success(f"Готово: добавлено {added}, обновлено {updated}, пропущено {skipped}.")
-            if errors:
-                with st.expander("⚠️ Строки с ошибками"):
-                    for err in errors[:50]:
-                        st.write(err)
-            st.rerun()
-        except Exception as e:
-            st.error(f"Не удалось импортировать файл: {e}")
-
-    st.markdown("---")
-    products = load_products()
-    if not products:
-        st.info("Каталог пуст.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            search = st.text_input("🔍 Поиск")
-        with c2:
-            cat_filter = st.selectbox("Категория", ["Все"] + CATEGORIES)
-        with c3:
-            sort_by = st.selectbox("Сортировка", ["Сначала новые","Сначала старые","По названию","По бренду"])
-
-        filtered = []
-        for i, p in enumerate(products):
-            if search and search.lower() not in (p.get('name','') + p.get('brand','') + p.get('article','')).lower():
-                continue
-            if cat_filter != "Все" and p.get('category','Другое') != cat_filter:
-                continue
-            filtered.append((i, p))
-
-        if sort_by == "Сначала старые":
-            filtered = sorted(filtered, key=lambda x: x[0])
-        elif sort_by == "По названию":
-            filtered = sorted(filtered, key=lambda x: x[1].get('name','').lower())
-        elif sort_by == "По бренду":
-            filtered = sorted(filtered, key=lambda x: x[1].get('brand','').lower())
-        else:
-            filtered = sorted(filtered, key=lambda x: x[0], reverse=True)
-
-        st.caption(f"Найдено: {len(filtered)} из {len(products)}")
-        st.markdown("---")
-
-        for real_i, p in filtered:
-            with st.expander(f"{CATEGORY_EMOJI.get(p.get('category',''),'📦')} {p.get('brand','')} {p.get('name','')} — {p.get('article','')}"):
-                edit = st.toggle("✏️ Редактировать", key=f"edit_{real_i}")
-                if edit:
-                    ec1, ec2 = st.columns(2)
-                    with ec1:
-                        nn = st.text_input("Название", p.get('name',''), key=f"n_{real_i}")
-                        nb = st.text_input("Бренд", p.get('brand',''), key=f"b_{real_i}")
-                        na = st.text_input("Артикул", p.get('article',''), key=f"a_{real_i}")
-                    with ec2:
-                        ns = st.text_input("Размеры", p.get('sizes',''), key=f"s_{real_i}")
-                        nc = st.text_input("Цвет", p.get('color',''), key=f"c_{real_i}")
-                        ncat = st.selectbox("Категория", CATEGORIES,
-                            index=CATEGORIES.index(p.get('category','Другое')) if p.get('category','Другое') in CATEGORIES else 5,
-                            key=f"ct_{real_i}")
-                    nd = st.text_area("Описание", p.get('description',''), key=f"d_{real_i}")
-                    nsp = st.text_input("Характеристики", p.get('specs',''), key=f"sp_{real_i}")
-                    new_original = st.file_uploader(
-                        "📷 Исходное фото товара",
-                        type=["jpg", "jpeg", "png", "webp"],
-                        key=f"orig_{real_i}",
-                        help="Фото будет использоваться для автоматического создания карточки и Reels."
-                    )
-                    if st.button("💾 Сохранить", key=f"save_{real_i}"):
-                        updated = {
-                            "name": nn, "brand": nb, "article": na, "sizes": ns,
-                            "color": nc, "description": nd, "specs": nsp,
-                            "category": ncat, "date_added": p.get('date_added', str(datetime.date.today())),
-                            "price": p.get("price", ""),
-                            "stock": p.get("stock", 0),
-                            "total_stock": p.get("total_stock", p.get("stock", 0)),
-                            "stock_by_size": p.get("stock_by_size", {}),
-                        }
-                        # Не теряем сохранённую карточку и исходное фото.
-                        if p.get("card_image"):
-                            updated["card_image"] = p["card_image"]
-                        if p.get("original_image"):
-                            updated["original_image"] = p["original_image"]
-                        if new_original:
-                            original_buf = io.BytesIO()
-                            Image.open(new_original).convert("RGB").save(
-                                original_buf, format="JPEG", quality=95
-                            )
-                            updated["original_image"] = base64.b64encode(
-                                original_buf.getvalue()
-                            ).decode("ascii")
-                        update_product(p.get("_saas_record_id") or real_i, updated)
-                        st.success("Обновлено!")
-                        st.rerun()
-                else:
-                    st.write(f"**Размеры:** {p.get('sizes','—')}")
-                    st.write(f"**Цвет:** {p.get('color','—')}")
-                    st.write(f"**Описание:** {p.get('description','—')}")
-                    st.write(f"**Характеристики:** {p.get('specs','—')}")
-                    st.caption(f"Добавлено: {p.get('date_added','—')}")
-
-                if st.button("🗑️ Удалить", key=f"del_{real_i}"):
-                    delete_product(p.get("_saas_record_id") or real_i)
-                    st.rerun()
 
 # ========== 3: ТЕКСТЫ С ПУБЛИКАЦИЕЙ ==========
 with tab3:
@@ -1319,7 +1082,7 @@ with tab3:
 
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button(
+                if can("write_data") and st.button(
                     "🚀 Опубликовать в Telegram",
                     type="primary",
                     key=f"pub_tg_text_{st.session_state.get('text_generation_id', 0)}"
@@ -1562,13 +1325,13 @@ with tab4:
             pub1, pub2, pub3 = st.columns(3)
 
             with pub1:
-                if st.button("✈️ В Telegram", key="publish_reel_tg"):
+                if can("write_data") and st.button("✈️ В Telegram", key="publish_reel_tg"):
                     with st.spinner("Отправляю Reels в Telegram..."):
                         ok, msg = publish_reel_to_telegram(video_bytes, reel_caption)
                     (st.success if ok else st.error)(msg)
 
             with pub2:
-                if st.button("🅥 В VK", key="publish_reel_vk"):
+                if can("write_data") and st.button("🅥 В VK", key="publish_reel_vk"):
                     with st.spinner("Отправляю Reels в VK..."):
                         ok, msg = publish_reel_to_vk(video_bytes, reel_caption)
                     (st.success if ok else st.error)(msg)
@@ -1624,7 +1387,7 @@ with tab5:
                     sts = st.selectbox("Статус", STATUSES)
                     pr = st.selectbox("Приоритет", PRIORITIES)
                 idea = st.text_area("Идея / текст")
-                if st.form_submit_button("📌 Добавить в workflow"):
+                if can("write_data") and st.form_submit_button("📌 Добавить в workflow"):
                     add_plan(ensure_workflow({"date": str(pd), "platform": pl, "product": sp,
                                               "type": ct, "idea": idea, "status": sts, "priority": pr}))
                     st.success("Материал добавлен.")
@@ -1655,8 +1418,8 @@ with tab5:
                 with st.expander(f"{item.get('date','')} · {item.get('product','')} · {item.get('platform','')}"):
                     st.write(f"**Идея:** {item.get('idea','')}")
                     cs = item.get("status", "Идея")
-                    ns = st.selectbox("Этап", STATUSES, index=STATUSES.index(cs) if cs in STATUSES else 0, key=f"st_{ri}")
-                    if ns != cs:
+                    ns = st.selectbox("Этап", STATUSES, index=STATUSES.index(cs) if cs in STATUSES else 0, key=f"st_{ri}", disabled=not can("write_data"))
+                    if can("write_data") and ns != cs:
                         updated = change_status(item, ns)
                         update_plan(item.get("_saas_record_id") or ri, updated)
                         st.rerun()
@@ -1665,7 +1428,7 @@ with tab5:
                         st.caption("История изменений")
                         for h in item["history"][-5:]:
                             st.write(f"{h.get('time','')} · {h.get('from','')} → {h.get('to','')} · {h.get('actor','manager')}")
-                    if st.button("🗑️ Удалить", key=f"dp_{ri}"):
+                    if can("write_data") and st.button("🗑️ Удалить", key=f"dp_{ri}"):
                         delete_plan(item.get("_saas_record_id") or ri)
                         st.rerun()
 
@@ -1680,11 +1443,11 @@ with tab5:
                 st.write(item.get("idea", ""))
                 a, b = st.columns(2)
                 with a:
-                    if st.button("✅ Утвердить", key=f"approve_{i}"):
+                    if can("write_data") and st.button("✅ Утвердить", key=f"approve_{i}"):
                         update_plan(item.get("_saas_record_id") or i, change_status(item, "Готово"))
                         st.rerun()
                 with b:
-                    if st.button("↩️ Вернуть в работу", key=f"return_{i}"):
+                    if can("write_data") and st.button("↩️ Вернуть в работу", key=f"return_{i}"):
                         update_plan(item.get("_saas_record_id") or i, change_status(item, "В работе"))
                         st.rerun()
         st.markdown("---")
@@ -1837,96 +1600,19 @@ def load_settings():
 
 def save_settings(data):
     payload = {k: data.get(k, "") for k in DEFAULT_SETTINGS}
+    existing = data_load("settings", [])
+    if existing and isinstance(existing[0], dict) and existing[0].get("_saas_record_id"):
+        payload["_saas_record_id"] = existing[0]["_saas_record_id"]
     data_save("settings", [payload])
 
 
 
 # ========== 7: НАСТРОЙКИ ==========
 with tab7:
-    st.markdown('<div class="section-kicker">STORE SETTINGS</div><div class="section-title">Настройки магазина</div><div class="section-subtitle">Основная информация AI Agent Content Manager для контента и работы магазина.</div>', unsafe_allow_html=True)
-    settings = load_settings()
-
-    st.markdown("### 🏪 Магазин")
-    s1, s2 = st.columns(2)
-    with s1:
-        store_name = st.text_input("Название магазина", value=settings["store_name"], key="settings_store_name")
-        city = st.text_input("Город", value=settings["city"], key="settings_city")
-        phone = st.text_input("Телефон", value=settings["phone"], key="settings_phone")
-        manager_name = st.text_input("Имя менеджера", value=settings["manager_name"], key="settings_manager_name")
-        pickup_address = st.text_input("Адрес самовывоза", value=settings["pickup_address"], key="settings_pickup_address")
-    with s2:
-        order_contact = st.text_input("Контакт для заказа", value=settings["order_contact"], key="settings_order_contact")
-        telegram = st.text_input("Telegram", value=settings["telegram"], key="settings_telegram")
-        vk = st.text_input("VK", value=settings["vk"], key="settings_vk")
-        instagram = st.text_input("Instagram", value=settings["instagram"], key="settings_instagram")
-        st.info("Логотип хранится отдельно для каждого магазина.")
-
-    st.markdown("### 📦 Заказы и доставка")
-    o1, o2 = st.columns(2)
-    with o1:
-        payment_methods = st.text_input("Способы оплаты", value=settings["payment_methods"], key="settings_payment_methods")
-        delivery_methods = st.text_input("Способы доставки", value=settings["delivery_methods"], key="settings_delivery_methods")
-        delivery_terms = st.text_input("Сроки доставки", value=settings["delivery_terms"], key="settings_delivery_terms")
-    with o2:
-        delivery = st.text_input("Доставка", value=settings["delivery"], key="settings_delivery")
-        return_policy = st.text_area("Возврат и обмен", value=settings["return_policy"], key="settings_return_policy")
-
-    st.markdown("### ✍️ Контент")
-    c1, c2 = st.columns(2)
-    with c1:
-        content_signature = st.text_input("Подпись магазина", value=settings["content_signature"], key="settings_content_signature")
-        cta = st.text_input("Призыв к действию", value=settings["cta"], key="settings_cta")
-        hashtags = st.text_input("Стандартные хэштеги", value=settings["hashtags"], key="settings_hashtags")
-    with c2:
-        main_sport = st.selectbox("Основной спорт", ["Футбол", "Баскетбол", "Все виды спорта"], index=["Футбол", "Баскетбол", "Все виды спорта"].index(settings["main_sport"]) if settings["main_sport"] in ["Футбол", "Баскетбол", "Все виды спорта"] else 0, key="settings_main_sport")
-        card_template = st.selectbox("Шаблон карточки", list(TEMPLATES.keys()), index=list(TEMPLATES.keys()).index(settings["card_template"]) if settings["card_template"] in TEMPLATES else 0, key="settings_card_template")
-        show_price_on_cards = st.selectbox("Показывать цену на карточках", ["Нет", "Да"], index=0 if settings["show_price_on_cards"] == "Нет" else 1, key="settings_show_price")
-
-    st.markdown("### 🤖 AI-продавец")
-    a1, a2 = st.columns(2)
-    with a1:
-        ai_tone = st.selectbox("Стиль общения", ["Дружелюбный и профессиональный", "Коротко и по делу", "Более продающий"], index=["Дружелюбный и профессиональный", "Коротко и по делу", "Более продающий"].index(settings["ai_tone"]) if settings["ai_tone"] in ["Дружелюбный и профессиональный", "Коротко и по делу", "Более продающий"] else 0, key="settings_ai_tone")
-        ai_required_questions = st.text_input("Что обязательно уточнять", value=settings["ai_required_questions"], key="settings_ai_required")
-        ai_no_stock_reply = st.text_area("Если товара нет", value=settings["ai_no_stock_reply"], height=80, key="settings_ai_no_stock")
-    with a2:
-        ai_escalation_reply = st.text_area("Если нужен менеджер", value=settings["ai_escalation_reply"], height=80, key="settings_ai_escalation")
-        notification_contact = st.text_input("Куда отправлять уведомления о заявках", value=settings["notification_contact"], key="settings_notification_contact")
-    ai_seller_instructions = st.text_area("Главная инструкция для AI-продавца", value=settings["ai_seller_instructions"], height=110, key="settings_ai_seller")
-
-    st.markdown("### ❓ FAQ магазина")
-    faq = settings.get("faq", [])
-    faq_text = "\n".join(f"{item.get('question','')} | {item.get('answer','')}" for item in faq if isinstance(item, dict))
-    faq_input = st.text_area("Вопрос | Ответ — по одному на строку", value=faq_text, height=180, key="settings_faq")
-    st.caption("Пример: Как заказать? | Напишите название товара, размер и город.")
-
-    if st.button("💾 Сохранить все настройки", type="primary", key="save_store_settings"):
-        save_settings({
-            "store_name": store_name,
-            "city": city,
-            "delivery": delivery,
-            "telegram": telegram,
-            "vk": vk,
-            "instagram": instagram,
-            "order_contact": order_contact,
-            "phone": phone,
-            "manager_name": manager_name,
-            "pickup_address": pickup_address,
-            "payment_methods": payment_methods,
-            "return_policy": return_policy,
-            "delivery_methods": delivery_methods,
-            "delivery_terms": delivery_terms,
-            "content_signature": content_signature,
-            "cta": cta,
-            "hashtags": hashtags,
-            "ai_seller_instructions": ai_seller_instructions,
-            "notification_contact": notification_contact,
-            "card_template": card_template,
-            "show_price_on_cards": show_price_on_cards,
-            "main_sport": main_sport,
-            "ai_tone": ai_tone,
-            "ai_required_questions": ai_required_questions,
-            "ai_no_stock_reply": ai_no_stock_reply,
-            "ai_escalation_reply": ai_escalation_reply,
-            "faq": [{"question": line.split("|",1)[0].strip(), "answer": line.split("|",1)[1].strip()} for line in faq_input.splitlines() if "|" in line and line.split("|",1)[0].strip() and line.split("|",1)[1].strip()],
-        })
-        st
+    if can("settings"):
+        render_settings(
+            load_settings=load_settings, save_settings=save_settings, templates=TEMPLATES,
+            get_logo=get_logo, save_logo=save_logo,
+        )
+    else:
+        st.info("Настройки магазина доступны только владельцу и администратору.")

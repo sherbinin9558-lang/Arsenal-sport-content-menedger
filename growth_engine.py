@@ -48,16 +48,67 @@ def funnel(leads, orders, plan, products):
         "published_to_lead": (len(leads) / published * 100) if published else 0.0,
     }
 
+def _build_product_match_index(products):
+    """Token index prevents O(products × leads/orders/content) scans at 10k products."""
+    index = defaultdict(set)
+    for i, product in enumerate(products):
+        values = (
+            product.get("id"), product.get("article"), product.get("name"),
+            _title(product),
+        )
+        for value in values:
+            for token in re.findall(r"[\\wа-яё]+", _norm(value)):
+                if len(token) > 1:
+                    index[token].add(i)
+    return index
+
+
+def _candidate_product_indexes(text, index):
+    tokens = re.findall(r"[\\wа-яё]+", _norm(text))
+    candidates = set()
+    for token in tokens:
+        candidates.update(index.get(token, ()))
+    return candidates
+
+
 def product_performance(products, leads, orders, plan):
+    """Build product metrics in linear event passes with a small candidate set."""
+    match_index = _build_product_match_index(products)
+    content_counts = Counter()
+    lead_counts = Counter()
+    order_counts = Counter()
+    revenue_by_product = defaultdict(float)
+
+    for item in plan:
+        text = item.get("product")
+        for i in _candidate_product_indexes(text, match_index):
+            if _match(text, products[i]):
+                content_counts[i] += 1
+
+    for item in leads:
+        text = item.get("product") or item.get("message")
+        for i in _candidate_product_indexes(text, match_index):
+            if _match(text, products[i]):
+                lead_counts[i] += 1
+
+    for item in orders:
+        text = item.get("product")
+        for i in _candidate_product_indexes(text, match_index):
+            if _match(text, products[i]):
+                order_counts[i] += 1
+                if item.get("status") != "Отменён":
+                    revenue_by_product[i] += _amount(item.get("amount"))
+
     rows = []
-    for p in products:
-        title = _title(p) or "Товар"
-        ml = [x for x in leads if _match(x.get("product") or x.get("message"), p)]
-        mo = [x for x in orders if _match(x.get("product"), p)]
-        mc = sum(1 for x in plan if _match(x.get("product"), p))
-        revenue = sum(_amount(x.get("amount")) for x in mo if x.get("status") != "Отменён")
-        rows.append({"product": title, "content": mc, "leads": len(ml),
-                      "orders": len(mo), "revenue": revenue, "stock": _stock(p)})
+    for i, p in enumerate(products):
+        rows.append({
+            "product": _title(p) or "Товар",
+            "content": content_counts[i],
+            "leads": lead_counts[i],
+            "orders": order_counts[i],
+            "revenue": revenue_by_product[i],
+            "stock": _stock(p),
+        })
     return sorted(rows, key=lambda x: (-x["orders"], -x["revenue"], -x["leads"], -x["content"], x["product"]))
 
 def content_performance(plan):

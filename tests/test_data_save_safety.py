@@ -52,14 +52,14 @@ class OnboardingSettingsSafetyTests(unittest.TestCase):
 class SettingsRecordSafetyTests(unittest.TestCase):
     def test_settings_preserve_saas_record_identity(self):
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
-        self.assertIn('if data.get("_saas_record_id"):', source)
-        self.assertIn('record_id = data.get("_saas_record_id")', source)
-        self.assertIn('payload["_saas_record_id"] = record_id', source)
+        self.assertIn('existing = data_load("settings", [])', source)
+        self.assertIn('existing[0].get("_saas_record_id")', source)
+        self.assertIn('payload["_saas_record_id"] = existing[0]["_saas_record_id"]', source)
 
 
 class ProductStockRegressionTests(unittest.TestCase):
     def test_product_edit_preserves_stock_and_price_fields(self):
-        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[1] / "ui" / "catalog.py").read_text(encoding="utf-8")
         self.assertIn('"price": p.get("price", "")', source)
         self.assertIn('"stock": p.get("stock", 0)', source)
         self.assertIn('"total_stock": p.get("total_stock", p.get("stock", 0))', source)
@@ -148,12 +148,80 @@ class ContentIdentityRegressionTests(unittest.TestCase):
 
 class DemoModeRecordRegressionTests(unittest.TestCase):
     def test_record_index_helper_supports_local_mode_indices(self):
-        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
-        self.assertIn("if isinstance(record_id, int):", source)
-        self.assertIn('p.get("_saas_record_id") or real_i', source)
-        self.assertIn('item.get("_saas_record_id") or ri', source)
-        self.assertIn('reel_product.get("_saas_record_id") or st.session_state.get("r_sel", 0)', source)
+        root = Path(__file__).resolve().parents[1]
+        catalog = (root / "ui" / "catalog.py").read_text(encoding="utf-8")
+        app = (root / "app.py").read_text(encoding="utf-8")
+        self.assertIn('record_id = p.get("_saas_record_id") or local_i', catalog)
+        self.assertIn("render_catalog(", app)
+        self.assertIn("def _find_record_index(", app)
 
+
+class LargeCatalogPerformanceRegressionTests(unittest.TestCase):
+    def test_paged_catalog_api_and_single_record_writes_exist(self):
+        source = (Path(__file__).resolve().parents[1] / "saas_core.py").read_text(encoding="utf-8")
+        self.assertIn("def data_load_page(", source)
+        self.assertIn('Prefer"] = "count=exact"', source)
+        self.assertIn("def data_update_record(", source)
+        self.assertIn("def data_delete_record(", source)
+
+    def test_catalog_ui_is_paged(self):
+        source = (Path(__file__).resolve().parents[1] / "ui" / "catalog.py").read_text(encoding="utf-8")
+        self.assertIn("data_load_page", source)
+        self.assertIn("На странице", source)
+        self.assertIn("catalog_next", source)
+        self.assertNotIn("for real_i, p in enumerate(products):", source)
+
+
+class GrowthEnginePerformanceRegressionTests(unittest.TestCase):
+    def test_product_attribution_uses_match_index(self):
+        source = (Path(__file__).resolve().parents[1] / "growth_engine.py").read_text(encoding="utf-8")
+        self.assertIn("def _build_product_match_index", source)
+        self.assertIn("_candidate_product_indexes", source)
+        self.assertIn("O(products × leads/orders/content)", source)
+
+
+class ModularUiRegressionTests(unittest.TestCase):
+    def test_ui_modules_exist_and_app_routes_dashboard_settings(self):
+        root = Path(__file__).resolve().parents[1]
+        dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
+        settings = (root / "ui" / "settings.py").read_text(encoding="utf-8")
+        app = (root / "app.py").read_text(encoding="utf-8")
+        self.assertIn("def render_dashboard(", dashboard)
+        self.assertIn("def render_settings(", settings)
+        self.assertIn("from ui.dashboard import render_dashboard", app)
+        self.assertIn("from ui.settings import render_settings", app)
+        self.assertNotIn("with tab_dashboard:\n    # Reuse one dashboard snapshot", app)
+        self.assertNotIn("with tab7:\n    st.markdown", app)
+
+    def test_auth_cookie_has_reload_recovery(self):
+        source = (Path(__file__).resolve().parents[1] / "saas_core.py").read_text(encoding="utf-8")
+        self.assertIn('CookieController(key="saas_auth_cookie")', source)
+        self.assertIn("getAll()", source)
+        self.assertIn("_AUTH_COOKIE_DAYS = 30", source)
+        self.assertIn("attempts < 3", source)
+
+
+
+
+class RoleBasedUiRegressionTests(unittest.TestCase):
+    def test_write_controls_are_gated_in_catalog_and_content(self):
+        root = Path(__file__).resolve().parents[1]
+        catalog = (root / "ui" / "catalog.py").read_text(encoding="utf-8")
+        app = (root / "app.py").read_text(encoding="utf-8")
+        self.assertIn("can_write", catalog)
+        self.assertIn('if can_write and st.button("📦 Импортировать товары"', catalog)
+        self.assertIn('if can_write and st.button("🗑️ Удалить"', catalog)
+        self.assertIn('if can("write_data") and st.form_submit_button("📌 Добавить в workflow")', app)
+        self.assertIn('disabled=not can("write_data")', app)
+
+    def test_settings_ui_preserves_identity_and_requires_settings_permission(self):
+        root = Path(__file__).resolve().parents[1]
+        settings = (root / "ui" / "settings.py").read_text(encoding="utf-8")
+        max_ui = (root / "ui" / "max.py").read_text(encoding="utf-8")
+        app = (root / "app.py").read_text(encoding="utf-8")
+        self.assertIn('st.success("Настройки сохранены.")', settings)
+        self.assertIn('if can("settings"):', app)
+        self.assertIn('payload["_saas_record_id"] = current["_saas_record_id"]', max_ui)
 
 if __name__ == "__main__":
     unittest.main()

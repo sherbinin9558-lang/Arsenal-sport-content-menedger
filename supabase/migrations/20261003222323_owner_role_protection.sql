@@ -5,7 +5,7 @@ create or replace function public.set_member_role(target_tenant uuid, target_use
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $set_member_role$
 declare
   target_current_role text;

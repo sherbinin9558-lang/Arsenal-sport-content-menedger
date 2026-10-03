@@ -1,6 +1,6 @@
 """SaaS foundation: Supabase Auth + multi-tenant Postgres via PostgREST."""
 
-import hashlib, json, os, time
+import hashlib, json, os, re, time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import requests
@@ -10,7 +10,7 @@ try:
 except Exception:
     CookieController = None
 
-PLAN_LIMITS={"trial":{"products":100,"users":1,"content":100},"starter":{"products":1000,"users":3,"content":1000},"pro":{"products":10000,"users":10,"content":10000},"business":{"products":100000,"users":50,"content":100000}}
+PLAN_LIMITS={"trial":{"products":100,"users":1,"content":100},"starter":{"products":10000,"users":3,"content":1000},"pro":{"products":10000,"users":10,"content":10000},"business":{"products":100000,"users":50,"content":100000}}
 
 def _cfg(name, default=""):
     try: value=st.secrets.get(name, os.getenv(name, default))
@@ -62,22 +62,30 @@ class DataConflictError(RuntimeError):
 
 
 _AUTH_COOKIE = "saas_refresh_token"
+_AUTH_COOKIE_DAYS = 30
 
 def _auth_cookies():
     if CookieController is None:
         return None
     try:
         if "_saas_cookie_controller" not in st.session_state:
-            st.session_state["_saas_cookie_controller"] = CookieController()
+            st.session_state["_saas_cookie_controller"] = CookieController(key="saas_auth_cookie")
         return st.session_state["_saas_cookie_controller"]
     except Exception:
         return None
 
 def _read_refresh_token():
-    # Community Cloud filters many cookies from st.context.cookies.
-    # Read through the browser component first; use st.context only as a fallback.
+    # CookieController is browser-backed and may need one render cycle after a hard reload.
+    # getAll() is more reliable than a single-key read on a fresh Streamlit session.
     cookies = _auth_cookies()
     if cookies is not None:
+        try:
+            all_cookies = cookies.getAll() or {}
+            token = all_cookies.get(_AUTH_COOKIE)
+            if token:
+                return str(token)
+        except Exception:
+            pass
         try:
             token = cookies.get(_AUTH_COOKIE)
             if token:
@@ -98,9 +106,15 @@ def _persist_refresh_token(refresh_token):
     cookies = _auth_cookies()
     if cookies is not None:
         try:
-            cookies.set(_AUTH_COOKIE, str(refresh_token))
+            expiry = (datetime.now(timezone.utc) + timedelta(days=_AUTH_COOKIE_DAYS)).isoformat()
+            cookies.set(_AUTH_COOKIE, {"value": str(refresh_token), "expiry_date": expiry})
+            return
         except Exception:
-            pass
+            try:
+                cookies.set(_AUTH_COOKIE, str(refresh_token))
+                return
+            except Exception:
+                pass
 
 def _clear_refresh_token():
     cookies = _auth_cookies()
@@ -147,9 +161,9 @@ def _restore_session_from_cookie():
     # Give it one controlled second chance instead of showing the login screen.
     if not refresh_token:
         attempts = int(st.session_state.get("_saas_cookie_probe_attempts", 0))
-        if attempts < 1:
+        if attempts < 3:
             st.session_state["_saas_cookie_probe_attempts"] = attempts + 1
-            time.sleep(0.9)
+            time.sleep(0.6)
             refresh_token = _read_refresh_token()
     if not refresh_token:
         return False
@@ -231,6 +245,36 @@ def validate_session():
     return _restore_session_from_access_token() or _restore_session_from_cookie()
 
 def _rest_get(path,token,params=None,headers=None): return _request("GET",path,token=token,headers=headers,params=params or {})
+
+def _rest_get_paged(path, token, params=None):
+    _, key = _supabase_config()
+    if not key:
+        raise SupabaseRequestError("SUPABASE_ANON_KEY не настроен.")
+    h = _headers(token)
+    h["Prefer"] = "count=exact"
+    response = requests.get(
+        f"{_supabase_config()[0]}{path}",
+        headers=h,
+        params=params or {},
+        timeout=20,
+    )
+    try:
+        data = response.json()
+    except Exception:
+        data = {"message": response.text}
+    if not response.ok:
+        raise SupabaseRequestError(
+            data.get("msg") or data.get("message") or data.get("error_description") or str(data),
+            response.status_code,
+        )
+    total = None
+    content_range = response.headers.get("Content-Range", "")
+    if "/" in content_range:
+        try:
+            total = int(content_range.rsplit("/", 1)[1])
+        except (TypeError, ValueError):
+            total = None
+    return data, total
 def _rest_post(path,token,payload,headers=None): return _request("POST",path,token=token,headers=headers,json=payload)
 def _rest_patch(path,token,payload,params=None,headers=None): return _request("PATCH",path,token=token,headers=headers,params=params or {},json=payload)
 def _rest_delete(path,token,params=None,headers=None): return _request("DELETE",path,token=token,headers=headers,params=params or {})
@@ -402,7 +446,7 @@ def render_account_bar():
             st.rerun()
 
 def plan_catalog():
-    return {"starter":{"name":"STARTER","products":1000,"users":3,"description":"Для небольшого магазина"},"pro":{"name":"PRO","products":10000,"users":10,"description":"Для растущего бизнеса"},"business":{"name":"BUSINESS","products":100000,"users":50,"description":"Для сети и большого каталога"}}
+    return {"starter":{"name":"STARTER","products":10000,"users":3,"description":"Для небольшого магазина"},"pro":{"name":"PRO","products":10000,"users":10,"description":"Для растущего бизнеса"},"business":{"name":"BUSINESS","products":100000,"users":50,"description":"Для сети и большого каталога"}}
 
 def _service_key():
     try: value=st.secrets.get("SUPABASE_SERVICE_ROLE_KEY",os.getenv("SUPABASE_SERVICE_ROLE_KEY",""))
@@ -627,12 +671,14 @@ _INTERNAL_RECORD_KEY = "_saas_record_id"
 def _clean_payload(row):
     if not isinstance(row, dict):
         return row
-    return {k: v for k, v in row.items() if k != _INTERNAL_RECORD_KEY}
+    return {k: v for k, v in row.items() if k not in {_INTERNAL_RECORD_KEY, "_saas_updated_at"}}
 
 
 def _prepare_loaded_payload(row):
     payload = dict(row.get("payload") or {})
     payload[_INTERNAL_RECORD_KEY] = str(row.get("record_id"))
+    if row.get("updated_at"):
+        payload["_saas_updated_at"] = row.get("updated_at")
     return payload
 
 
@@ -686,6 +732,84 @@ def data_load(entity,default):
 
     st.session_state[_data_session_key(entity)] = baseline
     return loaded
+
+
+def data_load_page(entity, page=1, page_size=50, search="", category="Все"):
+    """Load one page only; designed for catalogs with thousands of records."""
+    entity = _validate_data_entity(entity)
+    page = max(1, int(page or 1))
+    page_size = max(10, min(100, int(page_size or 50)))
+    search = str(search or "").strip()
+    category = str(category or "Все").strip()
+
+    if not saas_enabled():
+        rows = data_load(entity, [])
+        q = search.lower()
+        if q:
+            rows = [r for r in rows if q in " ".join(str(r.get(k, "")) for k in ("name", "brand", "article")).lower()]
+        if category and category != "Все":
+            rows = [r for r in rows if r.get("category", "Другое") == category]
+        total = len(rows)
+        start = (page - 1) * page_size
+        return {"rows": rows[start:start + page_size], "total": total, "page": page, "page_size": page_size}
+
+    token = st.session_state.get("saas_access_token")
+    params = {
+        "select": "record_id,payload,created_at,updated_at",
+        "tenant_id": f"eq.{tenant_id()}",
+        "entity": f"eq.{entity}",
+        "order": "created_at.desc,record_id.desc",
+        "limit": str(page_size),
+        "offset": str((page - 1) * page_size),
+    }
+    if search:
+        q = re.sub(r"[*(),]", " ", search).strip()
+        if q:
+            params["or"] = f"(payload->>name.ilike.*{q}*,payload->>brand.ilike.*{q}*,payload->>article.ilike.*{q}*)"
+    if category and category != "Все":
+        params["payload->>category"] = f"eq.{category}"
+
+    rows, total = _rest_get_paged("/rest/v1/app_data", token, params=params)
+    prepared = [_prepare_loaded_payload(row) for row in rows]
+    return {"rows": prepared, "total": int(total if total is not None else len(prepared)), "page": page, "page_size": page_size}
+
+
+def data_update_record(entity, record_id, payload, expected_updated_at):
+    """Atomically update one record without rewriting the whole entity."""
+    entity = _validate_data_entity(entity)
+    if not record_id or not expected_updated_at:
+        raise DataConflictError("Не удалось проверить версию записи. Обновите страницу и повторите.")
+    if saas_enabled() and not can("write_data"):
+        raise PermissionError("У вашей роли нет прав на изменение данных магазина.")
+    try:
+        _rest_post("/rest/v1/rpc/save_app_data_batch", st.session_state.get("saas_access_token"), {
+            "p_tenant_id": tenant_id(), "p_entity": entity,
+            "p_rows": [{"record_id": str(record_id), "payload": _clean_payload(payload),
+                        "expected_updated_at": expected_updated_at, "is_new": False, "is_deleted": False}],
+        })
+    except SupabaseRequestError as e:
+        if e.status_code in (400, 409) and any(x in str(e) for x in ("DATA_CONFLICT", "RECORD_NOT_FOUND")):
+            raise DataConflictError("Данные изменились в другой сессии. Обновите страницу и повторите.")
+        raise
+
+
+def data_delete_record(entity, record_id, expected_updated_at):
+    """Atomically delete one record without rewriting the whole entity."""
+    entity = _validate_data_entity(entity)
+    if not record_id or not expected_updated_at:
+        raise DataConflictError("Не удалось проверить версию записи. Обновите страницу и повторите.")
+    if saas_enabled() and not can("write_data"):
+        raise PermissionError("У вашей роли нет прав на изменение данных магазина.")
+    try:
+        _rest_post("/rest/v1/rpc/save_app_data_batch", st.session_state.get("saas_access_token"), {
+            "p_tenant_id": tenant_id(), "p_entity": entity,
+            "p_rows": [{"record_id": str(record_id), "expected_updated_at": expected_updated_at,
+                        "is_new": False, "is_deleted": True}],
+        })
+    except SupabaseRequestError as e:
+        if e.status_code in (400, 409) and any(x in str(e) for x in ("DATA_CONFLICT", "RECORD_NOT_FOUND")):
+            raise DataConflictError("Данные изменились в другой сессии. Обновите страницу и повторите.")
+        raise
 
 
 def data_save(entity,rows):

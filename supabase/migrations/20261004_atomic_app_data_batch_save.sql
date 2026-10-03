@@ -1,7 +1,6 @@
 -- Atomic multi-record app_data persistence with optimistic concurrency.
--- The function is intentionally SECURITY DEFINER because it performs one
--- transaction across tenant app_data rows. It validates the authenticated
--- user's writer role before touching data and is not callable by anon/public.
+-- The function is SECURITY INVOKER so PostgREST executes it as the authenticated
+-- caller. It validates the writer role before touching data and runs atomically.
 
 create or replace function public.save_app_data_batch(
   p_tenant_id uuid,
@@ -11,7 +10,7 @@ create or replace function public.save_app_data_batch(
 returns boolean
 language plpgsql
 security invoker
-set search_path = public
+set search_path = ''
 as $save_app_data_batch$
 declare
   item jsonb;
@@ -128,6 +127,4 @@ $save_app_data_batch$;
 
 revoke all on function public.save_app_data_batch(uuid,text,jsonb) from public;
 revoke all on function public.save_app_data_batch(uuid,text,jsonb) from anon;
-revoke all on function public.save_app_data_batch(uuid,text,jsonb,text[]) from public;
-revoke all on function public.save_app_data_batch(uuid,text,jsonb,text[]) from anon, authenticated;
 grant execute on function public.save_app_data_batch(uuid,text,jsonb) to authenticated;

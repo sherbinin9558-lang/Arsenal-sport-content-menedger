@@ -9,9 +9,17 @@ LEADS_FILE = Path("leads.json")
 STATUSES = ["Новый", "В работе", "Ожидает ответа", "Заказ оформлен", "Завершён", "Отменён"]
 LEAD_IMMUTABLE_FIELDS = frozenset({"id", "created_at"})
 
-def load_leads(): return data_load("leads", [])
+def load_leads():
+    import streamlit as st
+    key = "_app_leads_cache"
+    if key not in st.session_state:
+        st.session_state[key] = data_load("leads", [])
+    return st.session_state[key]
 
-def save_leads(leads): data_save("leads", leads)
+def save_leads(leads):
+    data_save("leads", leads)
+    import streamlit as st
+    st.session_state["_app_leads_cache"] = leads
 
 def create_lead(name="", contact="", source="Website", message="", product="", product_id="", content_id="", order_id=""):
     leads = load_leads()

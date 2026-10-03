@@ -9,7 +9,7 @@ create or replace function public.save_app_data_batch(
 returns boolean
 language plpgsql
 security invoker
-set search_path = public
+set search_path = ''
 as $save_app_data_batch$
 declare
   item jsonb;

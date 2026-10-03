@@ -10,9 +10,17 @@ ORDERS_FILE = Path("orders.json")
 ORDER_STATUSES = ("Новая", "Связались", "Ожидает оплаты", "Оплачен", "Собирается", "Отправлен", "Завершён", "Отменён")
 ORDER_IMMUTABLE_FIELDS = frozenset({"id", "created_at"})
 
-def load_orders(): return data_load("orders", [])
+def load_orders():
+    import streamlit as st
+    key = "_app_orders_cache"
+    if key not in st.session_state:
+        st.session_state[key] = data_load("orders", [])
+    return st.session_state[key]
 
-def save_orders(orders): data_save("orders", orders)
+def save_orders(orders):
+    data_save("orders", orders)
+    import streamlit as st
+    st.session_state["_app_orders_cache"] = orders
 
 def create_order(customer="", contact="", product="", product_id="", amount="", status="Новая", source="Manual", content_id="", lead_id=""):
     if status not in ORDER_STATUSES:
